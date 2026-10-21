@@ -8,13 +8,19 @@
 //! so the preview is decoded here and handed to [`photocraft_raw::fit_look`],
 //! which fits a matrix and tone curve and keeps the neutral fallback when the
 //! fit is not clearly better.
+//!
+//! Canon CR3, whose sensor data `photocraft-raw` does not decode, is read through Adobe DNG
+//! Converter when it is installed ([`crate::dng_converter`]): the DNG's calibrated development
+//! is then rendered like the camera's embedded JPEG ([`photocraft_raw::fit_rendering`]: tone,
+//! colour, and the camera's distortion and vignetting corrections). Without the converter a CR3
+//! opens as its embedded JPEG, as before.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use photocraft_cms::{Builtin, Intent, Profile, Transform};
 use photocraft_codecs::{self as codecs, ChannelLayout, Format, Image, SampleType};
-use photocraft_raw::{CameraLook, DevelopOptions, Limits, PreviewColorSpace, RawError, Reference, Sensor, WhiteBalance};
+use photocraft_raw::{CameraLook, DevelopOptions, Limits, PreviewColorSpace, RawError, RawFormat, Reference, Sensor, WhiteBalance};
 pub use photocraft_raw::{EXTENSIONS, Tone, retone};
 
 use crate::flat::image_to_document;
@@ -78,7 +84,12 @@ pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<
     if !exposure.is_finite() || !(-10.0..=10.0).contains(&exposure) {
         return Err(IoError::Raw(RawError::Malformed(format!("exposure {} EV is out of range", tuning.exposure))));
     }
-    let sensor = photocraft_raw::decode(bytes, &limits()).map_err(IoError::Raw)?;
+    let cr3 = is_cr3(bytes);
+    let sensor = if cr3 {
+        cr3_sensor(bytes, &limits()).map_err(|why| IoError::Raw(RawError::Unsupported(format!("Canon CR3 sensor data: {why}"))))?
+    } else {
+        photocraft_raw::decode(bytes, &limits()).map_err(IoError::Raw)?
+    };
     let slider = |v: f32| if v.is_finite() { v.clamp(-100.0, 100.0) } else { 0.0 };
     let tone = photocraft_raw::Tone {
         shadows: slider(tuning.shadows),
@@ -91,7 +102,12 @@ pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<
     // without colour calibration), so re-developing changes only what the sliders change.
     let camera_look = default_look(bytes, &sensor);
     let mut opts = DevelopOptions { limits: limits(), exposure, tone, camera_look, ..Default::default() };
-    let wb_applied = match sensor.camera_wb {
+    // A CR3 comes through a DNG, whose as-shot white balance is a neutral rather than camera
+    // multipliers: the same thing, inverted.
+    let as_shot = sensor
+        .camera_wb
+        .or_else(|| if cr3 { sensor.color.as_shot_neutral.filter(|n| n.iter().all(|v| v.is_finite() && *v > 1e-6)).map(|n| n.map(|v| 1.0 / v)) } else { None });
+    let wb_applied = match as_shot {
         Some(m) => {
             let g = wb_gains(tuning.temperature, tuning.tint);
             opts.white_balance = WhiteBalance::Multipliers([m[0] * g[0], m[1] * g[1], m[2] * g[2]]);
@@ -99,7 +115,7 @@ pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<
         }
         None => false,
     };
-    let dev = photocraft_raw::develop_sensor(&sensor, &opts).map_err(IoError::Raw)?;
+    let dev = if cr3 { develop_rendered(bytes, &sensor, &opts) } else { photocraft_raw::develop_sensor(&sensor, &opts) }.map_err(IoError::Raw)?;
     let wb = if wb_applied {
         format!("as-shot white balance, temperature {:+.0}, tint {:+.0}", tuning.temperature, tuning.tint)
     } else {
@@ -205,6 +221,14 @@ fn preview_profile(raw: &[u8], icc: Option<&[u8]>) -> Result<Option<Cow<'static,
 /// converts it to sRGB when it is in another colour space ([`preview_profile`]). `Err` says
 /// why there is no fit.
 pub fn fit_preview_look(raw: &[u8], sensor: &Sensor, opts: &DevelopOptions) -> Result<CameraLook, String> {
+    let (w, h, rgb) = preview_reference(raw)?;
+    photocraft_raw::fit_look(sensor, opts, &Reference { width: w, height: h, rgb: &rgb }).map_err(|e| e.to_string())
+}
+
+/// The camera's embedded JPEG as a colour-fit reference: the smallest preview at least
+/// `FIT_PREVIEW_EDGE` pixels long (else the largest), decoded, upright, as 8-bit sRGB
+/// (`width`, `height`, interleaved RGB).
+fn preview_reference(raw: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let previews = photocraft_raw::embedded_previews(raw);
     let long = |p: &photocraft_raw::Preview| p.width.max(p.height);
     let pick = previews
@@ -218,14 +242,50 @@ pub fn fit_preview_look(raw: &[u8], sensor: &Sensor, opts: &DevelopOptions) -> R
         return Err("the embedded preview is not 8-bit RGB".into());
     }
     let (w, h) = img.dimensions();
-    let mut rgb: Cow<[u8]> = Cow::Borrowed(img.data());
-    if let Some(src) = preview_profile(raw, img.icc.as_deref())? {
-        let t = Transform::new(&src, Builtin::Srgb.profile(), Intent::RelativeColorimetric, false).map_err(|e| e.to_string())?;
-        let mut out = vec![0u8; rgb.len()];
-        t.convert_u8(&rgb, 3, &mut out, 3, false);
-        rgb = Cow::Owned(out);
+    let rgb = match preview_profile(raw, img.icc.as_deref())? {
+        Some(src) => {
+            let t = Transform::new(&src, Builtin::Srgb.profile(), Intent::RelativeColorimetric, false).map_err(|e| e.to_string())?;
+            let mut out = vec![0u8; img.data().len()];
+            t.convert_u8(img.data(), 3, &mut out, 3, false);
+            out
+        }
+        None => img.data().to_vec(),
+    };
+    Ok((w, h, rgb))
+}
+
+/// `true` for a Canon CR3, whose sensor data `photocraft-raw` cannot decode itself (it is read
+/// through Adobe DNG Converter, see [`crate::dng_converter`]).
+fn is_cr3(bytes: &[u8]) -> bool {
+    photocraft_raw::identify(bytes) == Some(RawFormat::Cr3)
+}
+
+/// A CR3's sensor data and colour calibration, from the DNG Adobe DNG Converter makes of it.
+fn cr3_sensor(bytes: &[u8], limits: &Limits) -> Result<Sensor, String> {
+    let dng = crate::dng_converter::convert(bytes, "CR3")?;
+    photocraft_raw::decode(&dng, limits).map_err(|e| format!("the converted DNG does not decode: {e}"))
+}
+
+/// Develops calibrated sensor data with `opts`, then renders it like the camera's own JPEG
+/// embedded in `bytes` ([`photocraft_raw::fit_rendering`]: tone, colour and the lens corrections
+/// the camera applied). The rendering is learned from the default development, so raw-stage
+/// sliders in `opts` are applied under it rather than fitted away. Without a usable preview the
+/// calibrated development stays, with a warning.
+fn develop_rendered(bytes: &[u8], sensor: &Sensor, opts: &DevelopOptions) -> Result<photocraft_raw::Developed, RawError> {
+    let mut dev = photocraft_raw::develop_sensor(sensor, opts)?;
+    let defaults = DevelopOptions { limits: opts.limits, demosaic: opts.demosaic, ..Default::default() };
+    let neutral = if *opts == defaults { None } else { Some(photocraft_raw::develop_sensor(sensor, &defaults)?) };
+    let rendering = preview_reference(bytes).and_then(|(width, height, rgb)| {
+        photocraft_raw::fit_rendering(neutral.as_ref().unwrap_or(&dev), &Reference { width, height, rgb: &rgb }).map_err(|e| e.to_string())
+    });
+    match rendering {
+        Ok(r) => {
+            r.apply(&mut dev)?;
+            dev.warnings.push(r.note());
+        }
+        Err(why) => dev.warnings.push(format!("colour not matched to the camera's JPEG ({why}); developed with the file's own calibration")),
     }
-    photocraft_raw::fit_look(sensor, opts, &Reference { width: w, height: h, rgb: &rgb }).map_err(|e| e.to_string())
+    Ok(dev)
 }
 
 /// Decodes and develops; a file without colour calibration gets a look fitted to its preview.
@@ -250,6 +310,20 @@ pub const DEVELOPED_NOTE: &str = "developed with default settings";
 /// colour calibration gets one fitted to its embedded JPEG when that clearly helps.
 pub fn import_raw_with(name: &str, bytes: &[u8], opts: &DevelopOptions) -> Result<ImportResult, IoError> {
     let format = photocraft_raw::identify(bytes).map(|f| f.name()).unwrap_or("camera raw");
+    // CR3: the sensor data through Adobe DNG Converter, rendered like the camera's JPEG. Without
+    // the converter, the camera's JPEG preview as before, saying how to get the raw data.
+    let mut cr3_note = None;
+    if is_cr3(bytes) {
+        match cr3_sensor(bytes, &opts.limits) {
+            Ok(sensor) => {
+                let dev = develop_rendered(bytes, &sensor, opts).map_err(IoError::Raw)?;
+                let summary =
+                    format!("{DEVELOPED_NOTE} ({} demosaic, as-shot white balance; sensor data read through Adobe DNG Converter)", opts.demosaic.id());
+                return developed_document(name, format, dev, &summary);
+            }
+            Err(why) => cr3_note = Some(format!("{format}: the raw sensor data was not developed: {why}")),
+        }
+    }
     match develop_fitted(bytes, opts) {
         Ok(dev) => {
             let summary = format!("{DEVELOPED_NOTE} ({} demosaic, as-shot white balance)", opts.demosaic.id());
@@ -266,6 +340,9 @@ pub fn import_raw_with(name: &str, bytes: &[u8], opts: &DevelopOptions) -> Resul
                         p.width, p.height
                     ),
                 );
+                if let Some(note) = cr3_note {
+                    r.warnings.insert(1, note);
+                }
                 Ok(r)
             }
             None => Err(IoError::Raw(RawError::Unsupported(reason))),

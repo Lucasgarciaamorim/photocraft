@@ -40,6 +40,7 @@ pub mod blocks;
 pub mod camera_raw_xmp;
 mod channel_map;
 pub mod comps_map;
+pub mod dng_converter;
 pub mod doc_path;
 pub mod effects_map;
 pub mod exr_parts;

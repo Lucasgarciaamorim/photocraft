@@ -59,6 +59,12 @@ Implemented only from public specifications, papers and observation of files:
   Apache-2.0, same organisation); no LightCraft code was used. Pool-adjacent-violators isotonic
   regression (Ayer et al., 1955), Tukey's biweight (Beaton & Tukey, 1974), ridge regression
   (Hoerl & Kennard, 1970) and the CIE 1976 L\*a\*b\* colour difference.
+* A camera's rendering of calibrated raw data learned from its embedded JPEG (`fit_rendering`,
+  `src/render_lut.rs`, our own design): a trilinear 3D lookup table fitted by penalised least
+  squares (thin-plate-like smoothness: the squared graph Laplacian of the lattice, solved by
+  Jacobi-preconditioned conjugate gradients, Hestenes & Stiefel, 1952), Catmull-Rom resampling
+  (Catmull & Rom, 1974) for the camera's radial distortion correction, which is found by
+  luminance correlation, and a radial `1 + a·r² + b·r⁴` model of its vignetting correction.
 
 No code from dcraw, LibRaw, rawspeed, rawler, rawloader or darktable was read or used, and no
 camera colour tables were copied.
@@ -80,7 +86,7 @@ camera colour tables were copied.
 | Nikon "lossy after split" NEF, Sony "Compressed RAW 2", Pentax compressed PEF, RW2 RawFormat 6 and newer, Olympus compressed ORF | Unsupported: no public description of these codes was found apart from GPL decoder source, which this crate may not use (clean-room). `photocraft-io` opens the embedded JPEG preview instead |
 | Fujifilm RAF, uncompressed (X-Trans I–V, GFX and Bayer bodies since about 2010) | Decoded: 16-bit containers (either byte order), 12-bit LSB-first packing, 14-bit packing in 32-bit words; X-Trans 6×6 or Bayer 2×2 layout, black, as-shot WB, crop, RawExposureBias, orientation from the preview's EXIF |
 | Fujifilm compressed RAF, early FinePix / SuperCCD RAF (no CFA TIFF) | Unsupported (no public description of the compression); preview fallback |
-| CR3 | Native CRX unsupported; bounded JPEG-track/PRVW preview fallback with CMT1 orientation. I/O labels the result as an 8-bit camera preview |
+| CR3 | Native CRX unsupported; bounded JPEG-track/PRVW preview fallback with CMT1 orientation. `photocraft-io` reads the sensor data through Adobe DNG Converter when it is installed and renders the DNG's calibrated development like the camera's embedded JPEG with `fit_rendering` (tone, colour, distortion and vignetting corrections); without it, it labels the result as an 8-bit camera preview |
 | X-Trans and other periodic non-Bayer CFAs (up to 16×16) | Demosaiced by one pattern-agnostic edge-directed method, whatever `Demosaic` is chosen |
 
 Nikon maker-note compression modes 6/10 select checked little-endian packed 12/14-bit

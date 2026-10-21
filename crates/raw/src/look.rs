@@ -409,7 +409,7 @@ fn sensor_cell(s: &Sensor, sc: &Scale, mult: [f64; 3], x0: usize, x1: usize, y0:
 
 /// Mean linear sRGB of a reference box, the fraction of its pixels with a
 /// clipped channel and an edge weight from its luminance spread.
-fn reference_cell(r: &Reference, lut: &[f64], x0: usize, x1: usize, y0: usize, y1: usize) -> Option<([f64; 3], f64, f64)> {
+pub(crate) fn reference_cell(r: &Reference, lut: &[f64], x0: usize, x1: usize, y0: usize, y1: usize) -> Option<([f64; 3], f64, f64)> {
     let rw = r.width as usize;
     let mut sum = [0.0f64; 3];
     let (mut l1, mut l2, mut n, mut clipped) = (0.0f64, 0.0f64, 0usize, 0usize);
@@ -437,7 +437,7 @@ fn reference_cell(r: &Reference, lut: &[f64], x0: usize, x1: usize, y0: usize, y
     Some((sum.map(|v| v / nf), clipped as f64 / nf, 1.0 / (1.0 + (cv / 0.15).powi(2))))
 }
 
-fn srgb_to_linear(v: f64) -> f64 {
+pub(crate) fn srgb_to_linear(v: f64) -> f64 {
     if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
 
